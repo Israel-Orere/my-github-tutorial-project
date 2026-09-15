@@ -1,0 +1,14 @@
+{
+  "name": "rare-friends-genesis-cloud-minter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "check": "node mint-bot.mjs --check",
+    "start": "node mint-bot.mjs"
+  },
+  "dependencies": {
+    "viem": "2.37.5"
+  }
+}
