@@ -1,22 +1,40 @@
 import {
   createPublicClient,
-  createWalletClient,
   defineChain,
   encodeFunctionData,
   http,
   isAddressEqual,
+  keccak256,
   zeroAddress,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { performance } from 'node:perf_hooks';
 
 const NFT = '0x116eaa62241751e0c98da43d458600c6c17cd361';
 const SEADROP = '0x00005EA00Ac477B1030CE78506496e8C2dE24bf5';
 const OPENSEA_FEE_RECIPIENT = '0x0000a26b00c1F0DF003000390027140000fAa719';
 const EXPECTED_WALLET = '0x810746D67175869935c0152a55f77Aa40C6f299c';
-const RPC_URL = process.env.RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
+
+const PUBLIC_RPC = 'https://rpc.mainnet.chain.robinhood.com';
+const DIRECT_SEQUENCER = 'https://sequencer.mainnet.chain.robinhood.com';
+const RPC_URL = process.env.RPC_URL || PUBLIC_RPC;
+const EXTRA_BROADCAST_RPCS = String(process.env.EXTRA_BROADCAST_RPCS || '')
+  .split(',')
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+// Exact same raw transaction is sent to every endpoint. This is one mint/one nonce/one tx hash.
+const BROADCAST_RPCS = [...new Set([
+  DIRECT_SEQUENCER,
+  RPC_URL,
+  PUBLIC_RPC,
+  ...EXTRA_BROADCAST_RPCS,
+])];
+
 const MAX_MINT_VALUE_WEI = BigInt(process.env.MAX_MINT_VALUE_WEI || '0');
-const ARM_WINDOW_MS = Number(process.env.ARM_WINDOW_MS || 45 * 60 * 1000);
-const SEND_OFFSET_MS = Number(process.env.SEND_OFFSET_MS || 75);
+const MAX_GAS_COST_WEI = BigInt(process.env.MAX_GAS_COST_WEI || '1000000000000000'); // 0.001 ETH
+const ARM_WINDOW_MS = Number(process.env.ARM_WINDOW_MS || 90 * 60 * 1000);
+const SEND_OFFSET_MS = Number(process.env.SEND_OFFSET_MS || 8);
 const CHECK_ONLY = process.argv.includes('--check');
 
 const robinhood = defineChain({
@@ -31,7 +49,7 @@ const robinhood = defineChain({
 
 const publicClient = createPublicClient({
   chain: robinhood,
-  transport: http(RPC_URL, { timeout: 10_000, retryCount: 3, retryDelay: 150 }),
+  transport: http(RPC_URL, { timeout: 8_000, retryCount: 3, retryDelay: 100 }),
 });
 
 const seaDropAbi = [
@@ -85,14 +103,19 @@ const nftAbi = [
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitUntil(targetMs) {
-  while (true) {
-    const left = targetMs - Date.now();
-    if (left <= 0) return;
-    if (left > 30_000) await sleep(Math.min(30_000, left - 20_000));
-    else if (left > 2_000) await sleep(Math.max(250, left - 1_000));
-    else if (left > 200) await sleep(Math.max(25, left - 100));
-    else await sleep(Math.min(10, Math.max(1, left)));
+// Uses monotonic high-resolution time for the final part of the launch wait.
+async function waitUntilEpoch(targetEpochMs) {
+  let remaining = targetEpochMs - Date.now();
+  if (remaining <= 0) return;
+
+  while (remaining > 50) {
+    await sleep(Math.max(1, remaining - 25));
+    remaining = targetEpochMs - Date.now();
+  }
+
+  const targetPerf = performance.now() + Math.max(0, targetEpochMs - Date.now());
+  while (performance.now() < targetPerf) {
+    // Intentional tiny busy-wait for the final ~50ms to avoid timer scheduling jitter.
   }
 }
 
@@ -131,6 +154,8 @@ function logState(state) {
       feeBps: Number(p.feeBps),
       restrictFeeRecipients: p.restrictFeeRecipients,
     },
+    broadcastEndpoints: BROADCAST_RPCS.length,
+    sendOffsetMs: SEND_OFFSET_MS,
   }, null, 2));
 }
 
@@ -151,6 +176,107 @@ function safetyChecks(state) {
   }
 }
 
+async function rpcCall(url, method, params, timeoutMs = 1500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const started = performance.now();
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({}));
+    const latencyMs = performance.now() - started;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (body.error) {
+      const error = new Error(body.error.message || JSON.stringify(body.error));
+      error.rpcCode = body.error.code;
+      error.latencyMs = latencyMs;
+      throw error;
+    }
+    return { result: body.result, latencyMs };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function warmBroadcastConnections() {
+  const results = await Promise.allSettled(
+    BROADCAST_RPCS.map(async (url) => {
+      const res = await rpcCall(url, 'eth_chainId', [], 1200);
+      return { url, latencyMs: res.latencyMs, chainId: res.result };
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      console.log(`WARM ${result.value.url} ${result.value.latencyMs.toFixed(1)}ms`);
+    } else {
+      console.log(`WARM FAILED: ${result.reason?.message || result.reason}`);
+    }
+  }
+}
+
+function acceptedDuplicateError(message = '') {
+  return /already known|known transaction|already imported|nonce too low/i.test(message);
+}
+
+async function broadcastOne(url, serializedTransaction) {
+  const started = performance.now();
+  try {
+    const res = await rpcCall(url, 'eth_sendRawTransaction', [serializedTransaction], 1800);
+    return {
+      ok: true,
+      url,
+      hash: res.result,
+      latencyMs: performance.now() - started,
+      status: 'accepted',
+    };
+  } catch (err) {
+    const message = err?.message || String(err);
+    if (acceptedDuplicateError(message)) {
+      return {
+        ok: true,
+        url,
+        hash: null,
+        latencyMs: performance.now() - started,
+        status: 'already-seen',
+      };
+    }
+    return {
+      ok: false,
+      url,
+      hash: null,
+      latencyMs: performance.now() - started,
+      status: message,
+    };
+  }
+}
+
+async function fanoutWave(serializedTransaction, wave) {
+  const results = await Promise.all(BROADCAST_RPCS.map((url) => broadcastOne(url, serializedTransaction)));
+  for (const r of results) {
+    console.log(`BROADCAST wave=${wave} ${r.ok ? 'OK' : 'ERR'} ${r.latencyMs.toFixed(1)}ms ${r.url} ${r.status}`);
+  }
+  return results;
+}
+
+async function ultraFastBroadcast(serializedTransaction) {
+  // Wave 1 is the real launch. Waves 2/3 resend the exact same signed tx/hash to cover transient transport failure.
+  const wave1 = fanoutWave(serializedTransaction, 1);
+  const wave2 = (async () => { await sleep(25); return fanoutWave(serializedTransaction, 2); })();
+  const wave3 = (async () => { await sleep(75); return fanoutWave(serializedTransaction, 3); })();
+
+  const waves = await Promise.all([wave1, wave2, wave3]);
+  const flat = waves.flat();
+  if (!flat.some((r) => r.ok)) {
+    throw new Error(`All broadcast paths failed: ${flat.map((r) => `${r.url}: ${r.status}`).join(' | ')}`);
+  }
+}
+
 async function main() {
   const state = await readState();
   logState(state);
@@ -168,7 +294,7 @@ async function main() {
   const msUntilStart = startMs - Date.now();
 
   if (msUntilStart > ARM_WINDOW_MS) {
-    console.log(`Public mint is ${Math.ceil(msUntilStart / 60000)} minutes away; this cron run exits. A later run will arm automatically.`);
+    console.log(`Public mint is ${Math.ceil(msUntilStart / 60000)} minutes away; this pass exits and the persistent runner will retry.`);
     return;
   }
 
@@ -184,29 +310,20 @@ async function main() {
     throw new Error(`Safety stop: secret signs as ${account.address}, expected ${EXPECTED_WALLET}.`);
   }
 
-  const walletClient = createWalletClient({
-    account,
-    chain: robinhood,
-    transport: http(RPC_URL, { timeout: 10_000, retryCount: 3, retryDelay: 100 }),
-  });
-
   const calldata = encodeFunctionData({
     abi: seaDropAbi,
     functionName: 'mintPublic',
     args: [NFT, OPENSEA_FEE_RECIPIENT, zeroAddress, 1n],
   });
 
-  if (msUntilStart > 0) {
-    console.log(`ARMED. Public mint starts ${new Date(startMs).toISOString()}. Preparing a pre-signed transaction.`);
-  } else {
-    console.log('ARMED. Public mint time has already arrived; preparing transaction now.');
-  }
+  console.log(`ARMED for ${new Date(startMs).toISOString()}. Read RPC=${RPC_URL}`);
+  console.log(`Broadcast fanout: ${BROADCAST_RPCS.join(' | ')}`);
 
-  // Refresh mutable transaction fields shortly before the boundary.
-  const prepAt = Math.max(Date.now(), startMs - 2500);
-  await waitUntil(prepAt);
+  // Do all mutable state reads and signing before launch. Nothing expensive remains at T=0.
+  const prepAt = Math.max(Date.now(), startMs - 4000);
+  await waitUntilEpoch(prepAt);
 
-  let latest = await readState();
+  const latest = await readState();
   logState(latest);
   safetyChecks(latest);
 
@@ -216,45 +333,60 @@ async function main() {
   ]);
 
   const maxPriorityFeePerGas = fees.maxPriorityFeePerGas ?? 1n;
-  const maxFeePerGas = (fees.maxFeePerGas ?? fees.gasPrice ?? 1n) * 2n + maxPriorityFeePerGas;
+  const baseMaxFee = fees.maxFeePerGas ?? fees.gasPrice ?? 1n;
+  const maxFeePerGas = baseMaxFee * 4n + maxPriorityFeePerGas;
+  const gas = 300000n;
+  const worstCaseGasCost = gas * maxFeePerGas;
+
+  if (worstCaseGasCost > MAX_GAS_COST_WEI) {
+    throw new Error(`Safety stop: max gas exposure ${worstCaseGasCost} wei exceeds MAX_GAS_COST_WEI=${MAX_GAS_COST_WEI}.`);
+  }
+  if (latest.balance < latest.publicDrop.mintPrice + worstCaseGasCost) {
+    throw new Error(`Insufficient ETH for configured gas ceiling. Balance=${latest.balance} wei.`);
+  }
 
   const serialized = await account.signTransaction({
-    chain: robinhood,
+    chainId: 4663,
     to: SEADROP,
     data: calldata,
     value: latest.publicDrop.mintPrice,
-    gas: 300000n,
+    gas,
     nonce,
     maxFeePerGas,
     maxPriorityFeePerGas,
     type: 'eip1559',
   });
 
+  const localHash = keccak256(serialized);
+  console.log(`PRE-SIGNED ${localHash} nonce=${nonce} worstCaseGasWei=${worstCaseGasCost}`);
+
+  // Pre-resolve DNS and establish warm TLS/HTTP connections immediately before the race.
+  const warmAt = Math.max(Date.now(), startMs - 900);
+  await waitUntilEpoch(warmAt);
+  await warmBroadcastConnections();
+
   const sendAt = Math.max(Date.now(), startMs + SEND_OFFSET_MS);
-  console.log(`Transaction pre-signed with nonce ${nonce}. Broadcasting at ${new Date(sendAt).toISOString()} (offset ${SEND_OFFSET_MS}ms).`);
-  await waitUntil(sendAt);
+  console.log(`LAUNCH target=${new Date(sendAt).toISOString()} offset=${SEND_OFFSET_MS}ms`);
+  await waitUntilEpoch(sendAt);
 
-  let hash;
-  try {
-    hash = await publicClient.sendRawTransaction({ serializedTransaction: serialized });
-  } catch (err) {
-    console.error(`Initial broadcast error: ${err.shortMessage || err.message}`);
-    // One immediate rebroadcast of the identical signed transaction protects against a transient RPC failure without creating a second mint nonce.
-    await sleep(100);
-    hash = await publicClient.sendRawTransaction({ serializedTransaction: serialized });
-  }
+  await ultraFastBroadcast(serialized);
+  console.log(`SUBMITTED ${localHash}`);
+  console.log(`Explorer: https://robinhoodchain.blockscout.com/tx/${localHash}`);
 
-  console.log(`SUBMITTED ${hash}`);
-  console.log(`Explorer: https://robinhoodchain.blockscout.com/tx/${hash}`);
+  const receipt = await publicClient.waitForTransactionReceipt({
+    hash: localHash,
+    confirmations: 1,
+    timeout: 60_000,
+    pollingInterval: 100,
+  });
 
-  const receipt = await publicClient.waitForTransactionReceipt({ hash, confirmations: 1, timeout: 60_000 });
   if (receipt.status !== 'success') {
-    throw new Error(`Mint transaction mined but reverted: ${hash}`);
+    throw new Error(`Mint transaction mined but reverted: ${localHash}`);
   }
 
   const finalState = await readState();
   console.log(`MINT CONFIRMED in block ${receipt.blockNumber}.`);
-  console.log(`Wallet mint count is now ${finalState.minterNumMinted}. Cloud bot stopping.`);
+  console.log(`Wallet mint count is now ${finalState.minterNumMinted}.`);
 }
 
 main().catch((err) => {
