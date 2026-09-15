@@ -6,7 +6,8 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "check": "node mint-bot.mjs --check",
-    "start": "node mint-bot.mjs"
+    "mint": "node mint-bot.mjs",
+    "start": "node runner.mjs"
   },
   "dependencies": {
     "viem": "2.37.5"
